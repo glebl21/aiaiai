@@ -1,14 +1,14 @@
 """
-VK AI Bot — Long Poll версия
+VK AI Bot — Long Poll версия с поддержкой фото
 """
 
 import requests
 import time
+import base64
 import logging
 from config import (
     VK_TOKEN, VK_GROUP_ID, VK_API_VERSION,
-    AI_PROVIDER, GROQ_API_KEY,
-    AI_SYSTEM_PROMPT, MAX_HISTORY_MESSAGES
+    GROQ_API_KEY, AI_SYSTEM_PROMPT, MAX_HISTORY_MESSAGES
 )
 
 logging.basicConfig(
@@ -47,17 +47,66 @@ def get_longpoll_server():
     return vk_call("groups.getLongPollServer", {"group_id": VK_GROUP_ID})
 
 
+def get_best_photo_url(photo):
+    """Получить URL фото максимального размера."""
+    sizes = photo.get("sizes", [])
+    if not sizes:
+        return None
+    # Сортируем по ширине и берём наибольшее
+    sizes_sorted = sorted(sizes, key=lambda s: s.get("width", 0), reverse=True)
+    return sizes_sorted[0].get("url")
+
+
+def download_image_base64(url):
+    """Скачать фото и закодировать в base64."""
+    resp = requests.get(url, timeout=15)
+    resp.raise_for_status()
+    return base64.b64encode(resp.content).decode("utf-8")
+
+
 # ─────────────────────────── AI (Groq) ───────────────────────────
 
-def ask_groq(user_id, user_text):
-    """Groq — бесплатно, llama-3.3-70b, очень быстрый."""
+def ask_groq(user_id, user_text, image_b64=None):
+    """Groq — текст + фото (если есть)."""
     history = dialog_history.setdefault(user_id, [])
-    history.append({"role": "user", "content": user_text})
+
+    # Формируем контент текущего сообщения
+    if image_b64:
+        # Мультимодальный запрос с фото
+        content = [
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/jpeg;base64,{image_b64}"
+                }
+            }
+        ]
+        if user_text:
+            content.append({"type": "text", "text": user_text})
+        else:
+            content.append({"type": "text", "text": "Опиши что на этом фото."})
+        model = "meta-llama/llama-4-scout-17b-16e-instruct"
+    else:
+        content = user_text
+        model = "llama-3.3-70b-versatile"
+
+    history.append({"role": "user", "content": content})
 
     if len(history) > MAX_HISTORY_MESSAGES * 2:
         history[:] = history[-MAX_HISTORY_MESSAGES * 2:]
 
-    messages = [{"role": "system", "content": AI_SYSTEM_PROMPT}] + history
+    # Для истории с картинками оставляем только текстовые сообщения
+    # (Groq не принимает картинки в истории, только в последнем сообщении)
+    text_history = []
+    for msg in history[:-1]:
+        if isinstance(msg["content"], list):
+            # Извлекаем только текст из мультимодальных сообщений
+            texts = [p["text"] for p in msg["content"] if p.get("type") == "text"]
+            text_history.append({"role": msg["role"], "content": " ".join(texts)})
+        else:
+            text_history.append(msg)
+
+    messages = [{"role": "system", "content": AI_SYSTEM_PROMPT}] + text_history + [history[-1]]
 
     resp = requests.post(
         "https://api.groq.com/openai/v1/chat/completions",
@@ -66,7 +115,7 @@ def ask_groq(user_id, user_text):
             "Content-Type": "application/json",
         },
         json={
-            "model": "llama-3.3-70b-versatile",
+            "model": model,
             "messages": messages,
             "max_tokens": 1024,
         },
@@ -87,11 +136,16 @@ def handle_event(event):
     msg = event.get("object", {}).get("message", {})
     user_id = msg.get("from_id")
     text = msg.get("text", "").strip()
+    attachments = msg.get("attachments", [])
 
-    if not text or user_id <= 0:
+    if user_id <= 0:
         return
 
-    log.info(f"← [{user_id}] {text}")
+    # Пропускаем если нет ни текста ни вложений
+    if not text and not attachments:
+        return
+
+    log.info(f"← [{user_id}] {text or '(фото)'} | вложений: {len(attachments)}")
 
     if text.lower() in ("/reset", "сброс", "/start"):
         dialog_history.pop(user_id, None)
@@ -100,14 +154,27 @@ def handle_event(event):
 
     try:
         vk_call("messages.setActivity", {"user_id": user_id, "type": "typing", "group_id": VK_GROUP_ID})
-        answer = ask_groq(user_id, text)
+
+        # Ищем фото среди вложений
+        image_b64 = None
+        for att in attachments:
+            if att.get("type") == "photo":
+                photo_url = get_best_photo_url(att["photo"])
+                if photo_url:
+                    log.info(f"   Скачиваю фото: {photo_url[:60]}...")
+                    image_b64 = download_image_base64(photo_url)
+                    log.info(f"   Фото скачано, размер base64: {len(image_b64)} символов")
+                break  # берём только первое фото
+
+        answer = ask_groq(user_id, text, image_b64=image_b64)
         send_message(user_id, answer)
+
     except requests.HTTPError as e:
         try:
             detail = e.response.json()
         except Exception:
             detail = e.response.text
-        log.error(f"HTTP ошибка от [{user_id}]: {e} | Детали: {detail}")
+        log.error(f"HTTP ошибка от [{user_id}]: {e} | {detail}")
         send_message(user_id, "Произошла ошибка. Попробуйте ещё раз чуть позже 🙏")
     except Exception as e:
         log.error(f"Ошибка от [{user_id}]: {e}")
@@ -119,7 +186,7 @@ def handle_event(event):
 def run_longpoll():
     log.info("🤖 VK AI Bot запускается...")
     log.info(f"   Группа: {VK_GROUP_ID}")
-    log.info(f"   AI: GROQ (llama-3.3-70b)")
+    log.info(f"   AI: GROQ (текст + фото)")
 
     server_info = get_longpoll_server()
     server = server_info["server"]
