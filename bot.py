@@ -1,6 +1,5 @@
 """
 VK AI Bot — Long Poll версия
-Получает сообщения из сообщества ВКонтакте и отвечает через нейросеть.
 """
 
 import requests
@@ -8,7 +7,7 @@ import time
 import logging
 from config import (
     VK_TOKEN, VK_GROUP_ID, VK_API_VERSION,
-    AI_PROVIDER, GEMINI_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY,
+    AI_PROVIDER, GROQ_API_KEY,
     AI_SYSTEM_PROMPT, MAX_HISTORY_MESSAGES
 )
 
@@ -19,7 +18,6 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# Хранилище истории диалогов: {user_id: [{"role": ..., "content": ...}]}
 dialog_history = {}
 
 
@@ -49,69 +47,10 @@ def get_longpoll_server():
     return vk_call("groups.getLongPollServer", {"group_id": VK_GROUP_ID})
 
 
-# ─────────────────────────── AI ───────────────────────────
+# ─────────────────────────── AI (Groq) ───────────────────────────
 
-def ask_gemini(user_id, user_text):
-    """Запрос к Google Gemini — БЕСПЛАТНО 1500 запросов/день."""
-    history = dialog_history.setdefault(user_id, [])
-    history.append({"role": "user", "content": user_text})
-
-    if len(history) > MAX_HISTORY_MESSAGES * 2:
-        history[:] = history[-MAX_HISTORY_MESSAGES * 2:]
-
-    # Конвертируем историю в формат Gemini
-    contents = []
-    for i, msg in enumerate(history):
-        role = "user" if msg["role"] == "user" else "model"
-        text = msg["content"]
-        # Системный промпт добавляем к первому сообщению пользователя
-        if i == 0 and msg["role"] == "user":
-            text = AI_SYSTEM_PROMPT + "\n\n" + text
-        contents.append({"role": role, "parts": [{"text": text}]})
-
-    resp = requests.post(
-        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}",
-        headers={"Content-Type": "application/json"},
-        json={"contents": contents},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    answer = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-    history.append({"role": "assistant", "content": answer})
-    return answer
-
-
-def ask_claude(user_id, user_text):
-    """Запрос к Claude (Anthropic)."""
-    history = dialog_history.setdefault(user_id, [])
-    history.append({"role": "user", "content": user_text})
-
-    if len(history) > MAX_HISTORY_MESSAGES * 2:
-        history[:] = history[-MAX_HISTORY_MESSAGES * 2:]
-
-    resp = requests.post(
-        "https://api.anthropic.com/v1/messages",
-        headers={
-            "x-api-key": ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-        json={
-            "model": "claude-haiku-4-5-20251001",
-            "max_tokens": 1024,
-            "system": AI_SYSTEM_PROMPT,
-            "messages": history,
-        },
-        timeout=30,
-    )
-    resp.raise_for_status()
-    answer = resp.json()["content"][0]["text"]
-    history.append({"role": "assistant", "content": answer})
-    return answer
-
-
-def ask_openai(user_id, user_text):
-    """Запрос к OpenAI (GPT)."""
+def ask_groq(user_id, user_text):
+    """Groq — бесплатно, llama-3.3-70b, очень быстрый."""
     history = dialog_history.setdefault(user_id, [])
     history.append({"role": "user", "content": user_text})
 
@@ -121,29 +60,22 @@ def ask_openai(user_id, user_text):
     messages = [{"role": "system", "content": AI_SYSTEM_PROMPT}] + history
 
     resp = requests.post(
-        "https://api.openai.com/v1/chat/completions",
+        "https://api.groq.com/openai/v1/chat/completions",
         headers={
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Authorization": f"Bearer {GROQ_API_KEY}",
             "Content-Type": "application/json",
         },
-        json={"model": "gpt-4o-mini", "messages": messages, "max_tokens": 1024},
+        json={
+            "model": "llama-3.3-70b-versatile",
+            "messages": messages,
+            "max_tokens": 1024,
+        },
         timeout=30,
     )
     resp.raise_for_status()
     answer = resp.json()["choices"][0]["message"]["content"]
     history.append({"role": "assistant", "content": answer})
     return answer
-
-
-def ask_ai(user_id, text):
-    if AI_PROVIDER == "gemini":
-        return ask_gemini(user_id, text)
-    elif AI_PROVIDER == "claude":
-        return ask_claude(user_id, text)
-    elif AI_PROVIDER == "openai":
-        return ask_openai(user_id, text)
-    else:
-        raise ValueError(f"Неизвестный AI провайдер: {AI_PROVIDER}")
 
 
 # ─────────────────────────── Обработка событий ───────────────────────────
@@ -168,7 +100,7 @@ def handle_event(event):
 
     try:
         vk_call("messages.setActivity", {"user_id": user_id, "type": "typing", "group_id": VK_GROUP_ID})
-        answer = ask_ai(user_id, text)
+        answer = ask_groq(user_id, text)
         send_message(user_id, answer)
     except requests.HTTPError as e:
         try:
@@ -178,7 +110,7 @@ def handle_event(event):
         log.error(f"HTTP ошибка от [{user_id}]: {e} | Детали: {detail}")
         send_message(user_id, "Произошла ошибка. Попробуйте ещё раз чуть позже 🙏")
     except Exception as e:
-        log.error(f"Ошибка при обработке сообщения от {user_id}: {e}")
+        log.error(f"Ошибка от [{user_id}]: {e}")
         send_message(user_id, "Произошла ошибка. Попробуйте ещё раз чуть позже 🙏")
 
 
@@ -187,7 +119,7 @@ def handle_event(event):
 def run_longpoll():
     log.info("🤖 VK AI Bot запускается...")
     log.info(f"   Группа: {VK_GROUP_ID}")
-    log.info(f"   AI: {AI_PROVIDER.upper()}")
+    log.info(f"   AI: GROQ (llama-3.3-70b)")
 
     server_info = get_longpoll_server()
     server = server_info["server"]
